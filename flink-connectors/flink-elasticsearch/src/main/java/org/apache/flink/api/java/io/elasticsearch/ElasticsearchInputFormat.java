@@ -3,19 +3,14 @@ package org.apache.flink.api.java.io.elasticsearch;
 import org.apache.flink.api.common.io.DefaultInputSplitAssigner;
 import org.apache.flink.api.common.io.RichInputFormat;
 import org.apache.flink.api.common.io.statistics.BaseStatistics;
-import org.apache.flink.api.common.typeinfo.TypeInfo;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
-import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.GenericInputSplit;
 import org.apache.flink.core.io.InputSplit;
 import org.apache.flink.core.io.InputSplitAssigner;
-import org.apache.flink.types.Row;
-
-import org.apache.flink.types.StringValue;
-import org.elasticsearch.action.get.GetRequest;
 import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.action.search.SearchScrollRequestBuilder;
 import org.elasticsearch.client.transport.TransportClient;
 import org.elasticsearch.common.network.NetworkModule;
 import org.elasticsearch.common.settings.Settings;
@@ -24,7 +19,6 @@ import org.elasticsearch.common.transport.TransportAddress;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryBuilders;
-import org.elasticsearch.index.query.WrapperQueryBuilder;
 import org.elasticsearch.search.SearchHit;
 import org.elasticsearch.transport.Netty3Plugin;
 import org.elasticsearch.transport.client.PreBuiltTransportClient;
@@ -38,7 +32,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.BiConsumer;
-import java.util.function.Function;
 
 /**
  * ES Input TODO.
@@ -47,14 +40,12 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 
 	private static final long serialVersionUID = 1L;
 	private static final Logger LOG = LoggerFactory.getLogger(ElasticsearchInputFormat.class);
+
 	private final BiConsumer<Map<String, Object>, T> esTypeMapper;
 
 	private boolean hasNext;
+	private int currHitIdx;
 
-	/**
-	 * User-provided HTTP Host.
-	 */
-	//private List<HttpHost> httpHosts;
 
 	/**
 	 * User-provided transport addresses.
@@ -62,13 +53,7 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 	 * <p>We are using {@link InetSocketAddress} because {@link TransportAddress} is not serializable in Elasticsearch 5.x.
 	 */
 	private List<InetSocketAddress> transportAddresses;
-
 	private String queryString;
-
-	private transient SearchResponse searchScrollResponse;
-	private transient SearchHit[] searchHits;
-	private int currHitIdx;
-
 	/**
 	 * The factory to configure the rest client.
 	 */
@@ -76,6 +61,15 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 	private TypeInformation<T> typeInfo;
 	private String indexName;
 
+	private int scrollTimeoutMs = 60000;
+	private String clusterName = "elasticsearch";
+
+	private transient SearchResponse searchScrollResponse;
+	private transient SearchHit[] searchHits;
+	private transient SearchScrollRequestBuilder scrollRequestBuilder;
+	private transient String scrollId;
+
+//  private List<HttpHost> httpHosts;
 //	private RestClientBuilder restClientBuilder;
 //	private RestClient client;
 
@@ -102,10 +96,8 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 	}
 
 	public TransportClient createClient(Map<String, String> clientConfig) {
-//
-//		Settings settings = Settings.builder()
-//			.put("cluster.name", "myClusterName").build();
-		Settings settings = Settings.builder().put(clientConfig)
+		Settings settings = Settings.builder()
+			.put(clientConfig)
 			.put(NetworkModule.HTTP_TYPE_KEY, Netty3Plugin.NETTY_HTTP_TRANSPORT_NAME)
 			.put(NetworkModule.TRANSPORT_TYPE_KEY, Netty3Plugin.NETTY_TRANSPORT_NAME)
 			.build();
@@ -134,7 +126,10 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 		//	throw new IllegalArgumentException("Using inputSplit is currently unsupported");
 		//}
 
-		client = createClient(new HashMap<>());
+		HashMap<String, String> clientConfig = new HashMap<>();
+		clientConfig.put("cluster.name", clusterName);
+		client = createClient(clientConfig);
+
 		client.listedNodes()
 			.forEach(n -> {
 				if(LOG.isDebugEnabled()) {
@@ -144,15 +139,21 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 
 		QueryBuilder queryBuilder = QueryBuilders.wrapperQuery(queryString);
 		searchScrollResponse = client.prepareSearch(indexName)
-			//.setScroll(new TimeValue(60000))
+			.setScroll(new TimeValue(scrollTimeoutMs))
 			.setQuery(queryBuilder)
-			.setSize(100)
+			.setSize(1)
 			.get();
 
+		scrollId = searchScrollResponse.getScrollId();
+
+		scrollRequestBuilder = client
+			.prepareSearchScroll(scrollId)
+			.setScroll(new TimeValue(scrollTimeoutMs));
+
 		searchHits = searchScrollResponse.getHits().getHits();
-		//hasNext = searchScrollResponse.getHits().getHits().length != 0;
 		hasNext = searchHits.length != 0;
 		currHitIdx = 0;
+
 //		HttpHost[] httpHostArr = new HttpHost[httpHosts.size()];
 //		httpHosts.toArray(httpHostArr);
 //
@@ -210,13 +211,22 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 		esTypeMapper.accept(hit.getSource(), rowReuse);
 
 		currHitIdx++;
-		hasNext = currHitIdx != searchHits.length;
 
-//		searchScrollResponse = client
-//			.prepareSearchScroll(searchScrollResponse.getScrollId())
-//			.setScroll(new TimeValue(60000))
-//			.execute()
-//			.actionGet();
+		boolean currScrollPageEnded = (currHitIdx == searchHits.length);
+		if (currScrollPageEnded) {
+
+			searchScrollResponse = scrollRequestBuilder
+				.execute()
+				.actionGet();
+			searchHits = searchScrollResponse.getHits().getHits();
+			currHitIdx = 0;
+
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("ES Current scroll ended '{}', fetching next page", scrollId);
+			}
+		}
+
+		hasNext = currHitIdx != searchHits.length;
 
 		return rowReuse;
 	}
@@ -257,6 +267,16 @@ public class ElasticsearchInputFormat<T> extends RichInputFormat<T, InputSplit> 
 
 		public ElasticsearchInputFormatBuilder<V> setTypeInfo(TypeInformation<V> typeInfo) {
 			inputFormat.typeInfo = typeInfo;
+			return this;
+		}
+
+		public ElasticsearchInputFormatBuilder<V> setScrollTimeout(int scrollTimeoutMs) {
+			inputFormat.scrollTimeoutMs = scrollTimeoutMs;
+			return this;
+		}
+
+		public ElasticsearchInputFormatBuilder<V> setClusterName(String clusterName) {
+			inputFormat.clusterName = clusterName;
 			return this;
 		}
 

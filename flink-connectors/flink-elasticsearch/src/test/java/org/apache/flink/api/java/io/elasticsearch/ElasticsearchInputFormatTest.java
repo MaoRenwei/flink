@@ -57,7 +57,7 @@ public class ElasticsearchInputFormatTest {
 
 		TypeInformation<MessageObj> typeInformation = PojoTypeInfo.of(MessageObj.class);
 
-		QueryBuilder query = QueryBuilders.termQuery("user", "mic");
+		QueryBuilder query = QueryBuilders.matchAllQuery();
 
 		EsMapper esMapper = new EsMapper();
 
