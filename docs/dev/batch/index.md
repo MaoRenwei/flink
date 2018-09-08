@@ -896,6 +896,17 @@ DataSet<Tuple2<String, Integer> dbData =
                      .finish()
     );
 
+// Read data from Elasticsearch using ElasticsearchInputFormat
+ElasticsearchInputFormat<MessageObj> elasticsearchInputFormat = ElasticsearchInputFormat.builder(
+			hostList, query, esJsonMapper, typeInformation)
+			.setParametersProvider(paramValuesProvider)
+			.setIndex("index-name")
+			.setClusterName("type-name")
+			.build();
+
+DataSet<MessageObj> input = env.createInput(elasticsearchInputFormat);
+
+
 // Note: Flink's program compiler needs to infer the data types of the data items which are returned
 // by an InputFormat. If this information cannot be automatically inferred, it is necessary to
 // manually provide the type information as shown in the examples above.
